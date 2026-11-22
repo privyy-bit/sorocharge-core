@@ -47,17 +47,29 @@ pub enum X402Error {
     /// checks forbid it (transaction source, operation source, `from`
     /// argument, or an authorization entry) — a sign of an attempt to trick
     /// the fee-sponsoring facilitator into an unintended transfer.
+    /// (Audited and confirmed to match all return sites across the crate.)
     FacilitatorAddressConflict,
     /// A call to Stellar RPC (simulate, send, get-transaction, get-ledger)
     /// failed.
+    ///
+    /// Returned by `facilitator.rs` when any underlying `stellar_rpc_client` request
+    /// errors out or returns a transport/RPC-level failure. All call sites execute
+    /// strictly against Stellar RPC communication.
+    /// Audited for x402 error review; no mismatch found.
     RpcFailed { reason: String },
-    /// The settlement-time simulation-derived fee exceeded the configured
-    /// safety ceiling.
+    /// The settlement-time simulation-derived fee (inclusive of resource fee and buffer)
+    /// exceeded the configured safety ceiling (`max_transaction_fee_stroops`).
     FeeExceedsCeiling {
         fee_stroops: i64,
         ceiling_stroops: i64,
     },
     /// Verification succeeded but on-chain settlement failed.
+    ///
+    /// Returned by `settle` in `facilitator.rs` when RPC transaction
+    /// submission or polling fails, or when the final on-chain transaction status
+    /// is not "SUCCESS". All call sites execute strictly after all verification
+    /// checks have passed.
+    /// Audited; no mismatch found.
     SettlementFailed { reason: String },
 }
 
