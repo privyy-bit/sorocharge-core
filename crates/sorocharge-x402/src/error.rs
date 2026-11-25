@@ -86,33 +86,48 @@ pub enum X402Error {
     /// checks forbid it (transaction source, operation source, `from`
     /// argument, or an authorization entry) — a sign of an attempt to trick
     /// the fee-sponsoring facilitator into an unintended transfer.
-    /// (Audited and confirmed: every call site returning this variant genuinely
-    /// checks for and rejects facilitator address conflicts per this condition.)
+    ///
+    /// Audited: all four return sites are in the facilitator's request
+    /// validation in `facilitator.rs` (shared by `verify` and `settle`), one
+    /// per location listed above — the operation's source account, the
+    /// transaction's source account, the transfer's `from` argument, and the
+    /// authorization entry's credential address. Each matches this
+    /// description exactly; no mismatch found.
     FacilitatorAddressConflict,
     /// A call to Stellar RPC (simulate, send, get-transaction, get-ledger)
     /// failed.
     ///
-    /// Call sites span `facilitator.rs`: simulation requests, transaction
-    /// submission, status polling via `getTransaction`, and ledger sequence
-    /// queries. All sites check conformance with RPC invocation outcomes
-    /// and response parsing errors when communicating with the Stellar RPC endpoint.
-    /// Audited for issue #312; no mismatch found.
+    /// Audited return sites, all in `facilitator.rs`: `getLatestLedger` and
+    /// `simulateTransaction` during request validation, and `getAccount`
+    /// (the facilitator's sequence number) and `simulateTransaction` during
+    /// `settle`. Each wraps a failed RPC call, matching this description.
+    /// Note that a failed `sendTransaction` or `getTransaction` poll is not
+    /// reported here: once verification has passed, `settle` reports those
+    /// as [`X402Error::SettlementFailed`] instead.
     RpcFailed { reason: String },
     /// The settlement-time simulation-derived fee exceeded the configured
-    /// safety ceiling. Returned specifically when simulating a payment transaction
-    /// yields a total transaction fee (including the inclusion buffer) greater than
-    /// `FacilitatorConfig::max_transaction_fee_stroops`.
+    /// safety ceiling.
+    ///
+    /// Audited: the only return site is `settle` in `facilitator.rs`, when
+    /// the settlement simulation's `min_resource_fee` plus
+    /// `FacilitatorConfig::inclusion_buffer_stroops` exceeds
+    /// `FacilitatorConfig::max_transaction_fee_stroops`. This matches the
+    /// description exactly; no mismatch found.
     FeeExceedsCeiling {
         fee_stroops: i64,
         ceiling_stroops: i64,
     },
     /// Verification succeeded but on-chain settlement failed.
     ///
-    /// Returned by `settle` in `facilitator.rs` when RPC transaction
-    /// submission or polling fails, or when the final on-chain transaction status
-    /// is not "SUCCESS". All call sites execute strictly after all verification
-    /// checks have passed.
-    /// Audited; no mismatch found.
+    /// Audited: the only return site is `settle` in `facilitator.rs`, when
+    /// `send_transaction_polling` (submission via `sendTransaction`, then
+    /// polling `getTransaction`) returns an error after every verification
+    /// check has passed. This matches the description; no mismatch found.
+    /// A transaction that is submitted but ends in a status other than
+    /// `SUCCESS` does not return this variant: `settle` returns `Ok` with a
+    /// `SettlementResponse` whose `success` is `false` and whose
+    /// `error_reason` carries that status, per the x402 `/settle` response
+    /// shape.
     SettlementFailed { reason: String },
 }
 
