@@ -291,3 +291,16 @@ writeFixture(
   },
   "signed_entry_xdr_base64",
 );
+
+const signedAddressV2Entry = await authorizeEntry(
+  buildAddressV2Entry(),
+  payerKeypair,
+  validUntilLedger,
+  networkPassphrase,
+);
+writeFixture(
+  "address_v2_transfer_signed",
+  signedAddressV2Entry,
+  { network_passphrase: networkPassphrase },
+  "signed_entry_xdr_base64",
+);

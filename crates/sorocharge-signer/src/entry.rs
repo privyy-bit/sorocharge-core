@@ -324,8 +324,8 @@ fn build_transfer_invocation(
 /// cryptographic weight of its own — the entry's signature is what the
 /// network actually verifies.
 fn random_nonce() -> Result<i64, SorochargeError> {
-    let bits = getrandom::u64().map_err(|e| SorochargeError::XdrEncodingFailed {
-        reason: format!("failed to generate nonce: {e}"),
+    let bits = getrandom::u64().map_err(|e| SorochargeError::NonceGenerationFailed {
+        reason: e.to_string(),
     })?;
     Ok(bits as i64)
 }
@@ -342,8 +342,10 @@ fn random_nonce() -> Result<i64, SorochargeError> {
 ///
 /// Returns [`SorochargeError::UnsupportedCredentialType`] for a
 /// `credential` this build of the library does not yet construct XDR for,
-/// and [`SorochargeError::XdrEncodingFailed`] if a value can't be encoded
-/// into its XDR-constrained shape (e.g. a `VecM` length limit).
+/// [`SorochargeError::XdrEncodingFailed`] if a value can't be encoded
+/// into its XDR-constrained shape (e.g. a `VecM` length limit), and
+/// [`SorochargeError::NonceGenerationFailed`] if the OS random-number source
+/// fails while drawing the nonce.
 ///
 /// # Example
 ///

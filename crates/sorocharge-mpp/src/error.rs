@@ -44,6 +44,10 @@ pub enum MppError {
         network: String,
     },
     /// The challenge has already passed its `expires` timestamp.
+    ///
+    /// Audited across `client.rs` and `server.rs`; every call site strictly checks
+    /// whether the current timestamp has passed the challenge's `expires` field.
+    /// No mismatch found.
     ChallengeExpired,
     /// `sorocharge-signer` failed to build or sign the charge entry.
     Signing(SorochargeError),
@@ -65,11 +69,35 @@ pub enum MppError {
     },
     /// An authorization entry used a credential type the spec forbids for
     /// pull mode (anything other than legacy `sorobanCredentialsAddress`).
+    ///
+    /// Audited for issue #302; no mismatch found. Returned by
+    /// `parse_payment_transaction` in `tx.rs` and by the defensive
+    /// `legacy_credential_fields` re-check in `server.rs`'s pull-mode path.
+    /// `parse_payment_transaction` is shared with push mode, but
+    /// `settle_push_mode` deliberately maps this variant to
+    /// [`VerificationFailed`](Self::VerificationFailed) — a push-mode
+    /// transaction has already settled on-chain, so the pull-mode signing
+    /// restriction is not re-litigated there — and so callers only ever
+    /// receive this variant from pull mode.
     ForbiddenCredentialType,
     /// A push-mode (`type="hash"`) credential was submitted against a
     /// challenge that specified `feePayer: true`, which the spec forbids.
+    ///
+    /// Audited for issue #303; no mismatch found. Returned only by
+    /// `settle_push_mode` in `server.rs`, as its first check — before the
+    /// replay store or RPC is consulted.
     PushModeForbidsFeePayer,
-    /// The server's own address appeared where the safety checks forbid it.
+    /// In sponsored pull mode (`feePayer: true`), the server's own address
+    /// appeared as the payer: either as the SEP-41 transfer's `from`
+    /// argument, or as the address on the authorization entry's credential.
+    /// Either would have the server pay the charge to itself out of its own
+    /// balance while also sponsoring the fee.
+    ///
+    /// Audited for issue #304; no mismatch found. Both call sites are in
+    /// `settle_pull_mode` in `server.rs`, inside the `feePayer: true`
+    /// branch. A sponsored transaction whose *source account* is not the
+    /// all-zeros placeholder is a different check and returns
+    /// [`VerificationFailed`](Self::VerificationFailed), not this variant.
     ServerAddressConflict,
     /// A call to Stellar RPC failed.
     RpcFailed {
@@ -144,7 +172,7 @@ impl fmt::Display for MppError {
             ),
             Self::ServerAddressConflict => write!(
                 f,
-                "server's own address appears where the safety checks forbid it"
+                "server's own address appears as the payer of a sponsored transaction"
             ),
             Self::RpcFailed { reason } => write!(f, "Stellar RPC call failed: {reason}"),
             Self::HashAlreadyConsumed => write!(f, "transaction hash has already been consumed"),

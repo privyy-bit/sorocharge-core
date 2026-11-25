@@ -149,8 +149,8 @@ Fails closed, in this order:
 ```rust
 pub fn verify_delegated_threshold(
     entry: &SignedEntry,
-    _expected: &ChargeParams,
-    _current_ledger: u32,
+    expected: &ChargeParams,
+    current_ledger: u32,
     network_passphrase: &str,
     signers_with_weights: &[(Address, u32)],
     threshold: u32,
@@ -159,8 +159,12 @@ pub fn verify_delegated_threshold(
 
 Checks that the valid signatures attached to a `Delegated` entry's signable nodes meet
 the account's actual threshold policy — stricter than `verify_entry`, which only proves
-at least one attached signature is genuine. `_expected` and `_current_ledger` are
-accepted for signature symmetry with `verify_entry` and are not consulted yet. Unused
+at least one attached signature is genuine. `expected.valid_until_ledger` and
+`current_ledger` bound the entry's expiry exactly as `verify_entry` does (`ExpiredEntry`
+/ `ExpirationExceedsAllowance`), before any signature work. If the summed weight of
+delegates whose signatures verify is below `threshold`, it returns `InvalidSignature`;
+a signature that fails to verify, or a signer missing from `signers_with_weights`, adds
+no weight rather than erroring on its own. Unused
 by the x402 and MPP adapters today (x402 forbids `AddressWithDelegates`; MPP accepts
 only legacy `Address` credentials for pull mode); it exists for direct
 `sorocharge-signer` callers using `Delegated` credentials.
@@ -209,10 +213,13 @@ first, see [Troubleshooting errors](../guides/troubleshooting.md):
 | `UnexpectedInvocationShape` | Not a bare SEP-41 transfer. |
 | `AssetMismatch` / `PayerMismatch` / `AmountMismatch` / `RecipientMismatch` | Field doesn't match. |
 | `AmountNonPositive` | The amount is zero or negative — invalid for a SEP-41 transfer. |
-| `InvalidSignature` | No genuine signature found. |
-| `NoMatchingCredentialNode` | A signer's address matches no node in the entry being signed. |
-| `SimulationEventsMalformed { reason }` | An event didn't decode, or lacks expected topics/data. |
-| `UnexpectedBalanceChange { reason }` | The simulation moved something other than the expected payment. |
-| `ExpectedTransferMissing` | The simulation doesn't show the expected transfer at all. |
-| `SigningFailed { reason }` | The `Signer` implementation returned an error, or isn't an `Ed25519` account. |
-| `XdrEncodingFailed { reason }` | A value didn't fit its XDR-constrained shape. |
+| `InvalidSignature` | No genuine signature found (`verify_entry`), or the genuine ones fall short of the threshold (`verify_delegated_threshold`). |
+| `NoMatchingCredentialNode` | A signer's address matches no node (top-level address or delegate) in an address-bearing entry being signed. `SourceAccount` entries are `UnsupportedCredentialType` instead. |
+| `SimulationEventsMalformed { reason }` | An event didn't decode, or a `transfer`/`mint`/`burn` from the asset lacks the topics or `i128` data its shape needs. |
+| `UnexpectedBalanceChange { reason }` | The simulation moved something other than the expected payment — or the `asset_contract` passed in isn't a contract address, so it never could. |
+| `ExpectedTransferMissing` | The simulation shows no balance-moving event at all (a wrong one is `UnexpectedBalanceChange`). |
+| `SigningFailed { reason }` | The `Signer` implementation returned an error from `sign_preimage`; propagated unchanged. |
+| `UnsupportedSignerAddress { address }` | `Signer::address()` is not an `Ed25519` account (`G...`). |
+| `XdrEncodingFailed { reason }` | A value didn't fit its XDR-constrained shape, or serializing an address/`HashIdPreimage` to XDR failed. |
+| `NonceGenerationFailed { reason }` | The OS random-number source failed while `build_charge_entry` drew the entry's nonce; nothing about the input is wrong, and a retry may succeed. |
+| `UnsupportedNetwork { network }` | The network passphrase is neither pubnet's nor testnet's; `network` is the rejected passphrase verbatim. |

@@ -395,6 +395,29 @@ mod tests {
         assert_eq!(result, Err(SorochargeError::ExpectedTransferMissing));
     }
 
+    /// Pins the documented fold-in on `UnexpectedBalanceChange`: an
+    /// `asset_contract` that is an account (`G...`), not a contract, can
+    /// never emit the expected payment, so the check fails closed before
+    /// reading any event — even on an otherwise valid simulation.
+    #[test]
+    fn rejects_an_asset_address_that_is_not_a_contract() {
+        let f = load();
+        let (_asset, payer, recipient, amount) = expected(&f);
+        let result = verify_transfer_effects(
+            &f.diagnostic_events_xdr_base64,
+            &someone_else(),
+            &payer,
+            &recipient,
+            amount,
+        );
+        assert_eq!(
+            result,
+            Err(SorochargeError::UnexpectedBalanceChange {
+                reason: "asset address is not a contract".to_string(),
+            })
+        );
+    }
+
     #[test]
     fn rejects_a_second_transfer_event() {
         let f = load();

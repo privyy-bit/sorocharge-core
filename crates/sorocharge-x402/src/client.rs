@@ -114,13 +114,13 @@ impl X402Client {
     ///
     /// # Errors
     ///
-    /// Returns [`X402Error::HttpRequestFailed`] if the underlying HTTP
+    /// Returns [`X402Error::HttpClientBuildFailed`] if the underlying HTTP
     /// client fails to construct (e.g. a broken TLS backend).
     pub fn new(request_timeout: std::time::Duration) -> Result<Self, X402Error> {
         let http = reqwest::Client::builder()
             .timeout(request_timeout)
             .build()
-            .map_err(|e| X402Error::HttpRequestFailed {
+            .map_err(|e| X402Error::HttpClientBuildFailed {
                 reason: e.to_string(),
             })?;
         Ok(Self { http })
@@ -149,13 +149,20 @@ impl X402Client {
                 .map_err(|_| X402Error::InvalidPaymentRequired {
                     reason: format!("invalid asset address: {}", requirements.asset),
                 })?;
-        let amount =
-            requirements
-                .amount
-                .parse()
-                .map_err(|_| X402Error::InvalidPaymentRequired {
-                    reason: format!("invalid amount: {}", requirements.amount),
-                })?;
+        // `i128::from_str` accepts a leading `-`, so a parse alone would let
+        // a server's challenge ask this client to sign a negative or zero
+        // transfer. Reject both here, before anything is signed.
+        let amount = requirements
+            .amount
+            .parse::<i128>()
+            .ok()
+            .filter(|amount| *amount > 0)
+            .ok_or_else(|| X402Error::InvalidPaymentRequired {
+                reason: format!(
+                    "invalid amount (must be a positive base-unit integer): {}",
+                    requirements.amount
+                ),
+            })?;
         let recipient =
             requirements
                 .pay_to
@@ -234,16 +241,11 @@ impl X402Client {
         if first.status() == reqwest::StatusCode::OK {
             return Ok(first);
         }
-        if first.status() == reqwest::StatusCode::PAYMENT_REQUIRED {
-            // Protocol-level 402: build and sign, then retry with signature.
-            // This is not a transient failure; it's the expected payment challenge.
-        } else if first.status().is_server_error() {
-            // Transient 5xx: retry with backoff is handled by retry_get,
-            // but if we exhausted retries, fail now.
-            return Err(X402Error::UnexpectedStatus {
-                status: first.status().as_u16(),
-            });
-        } else {
+        if first.status() != reqwest::StatusCode::PAYMENT_REQUIRED {
+            // Anything other than 200 / 402 on the unpaid request — including
+            // a 5xx, which `retry_get` returns as-is rather than retrying —
+            // is a status this client cannot continue from. Nothing has been
+            // signed yet, so this is safe for the caller to retry.
             return Err(X402Error::UnexpectedStatus {
                 status: first.status().as_u16(),
             });
@@ -255,7 +257,7 @@ impl X402Client {
             .ok_or(X402Error::MissingPaymentRequiredHeader)?
             .to_str()
             .map_err(|e| X402Error::InvalidPaymentRequired {
-                reason: e.to_string(),
+                reason: format!("header value is not visible ASCII: {e}"),
             })?;
         let payment_required = decode_header_json::<PaymentRequired>(header_value)
             .map_err(|reason| X402Error::InvalidPaymentRequired { reason })?;
@@ -305,7 +307,9 @@ impl X402Client {
             })?;
 
         if second.status() != reqwest::StatusCode::OK {
-            return Err(X402Error::UnexpectedStatus {
+            // The signed credential has been sent; the server may have
+            // settled it before answering non-200. Surface that distinctly.
+            return Err(X402Error::UnexpectedStatusAfterPayment {
                 status: second.status().as_u16(),
             });
         }
@@ -489,5 +493,203 @@ mod tests {
             "expected NoAcceptablePaymentRequirements, got {result:?}"
         );
         assert_eq!(resource.request_count(), 1);
+    }
+
+    /// Serves `router` on an ephemeral localhost port and returns the URL of
+    /// its `/resource` route.
+    async fn spawn_router(router: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral localhost port");
+        let addr = listener.local_addr().expect("read the bound address");
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.expect("mock server");
+        });
+        format!("http://{addr}/resource")
+    }
+
+    /// A resource that answers the unpaid request with a valid 402
+    /// challenge and the payment-bearing retry with `paid_status`.
+    async fn spawn_resource_answering_paid_retry_with(
+        required: PaymentRequired,
+        paid_status: axum::http::StatusCode,
+    ) -> String {
+        let encoded = BASE64.encode(serde_json::to_vec(&required).expect("serialize"));
+        let handler = move |headers: axum::http::HeaderMap| {
+            let encoded = encoded.clone();
+            async move {
+                if headers.contains_key(super::PAYMENT_SIGNATURE_HEADER) {
+                    return axum::response::IntoResponse::into_response(paid_status);
+                }
+                let mut out = axum::http::HeaderMap::new();
+                out.insert(
+                    super::PAYMENT_REQUIRED_HEADER,
+                    axum::http::HeaderValue::from_str(&encoded).expect("header value"),
+                );
+                axum::response::IntoResponse::into_response((
+                    axum::http::StatusCode::PAYMENT_REQUIRED,
+                    out,
+                ))
+            }
+        };
+        spawn_router(axum::Router::new().route("/resource", axum::routing::get(handler))).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unexpected_status_on_the_unpaid_request_is_unexpected_status() {
+        for status in [
+            axum::http::StatusCode::NOT_FOUND,
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            let url = spawn_router(axum::Router::new().route(
+                "/resource",
+                axum::routing::get(move || async move { status }),
+            ))
+            .await;
+            let client = X402Client::new(Duration::from_secs(5)).expect("client");
+            let signer = TestSigner::from_seed([0x55; 32]);
+
+            let result = client.get_with_payment(&url, &signer, NETWORK, 1_000).await;
+
+            assert_eq!(
+                result.err(),
+                Some(X402Error::UnexpectedStatus {
+                    status: status.as_u16()
+                }),
+                "unpaid request answered {status}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn non_200_on_the_paid_retry_is_unexpected_status_after_payment() {
+        // A 402 on the retry (credential rejected) contradicts
+        // UnexpectedStatus's "neither 402 nor 200" contract, and a 5xx on the
+        // retry is ambiguous about settlement; both must be distinguishable
+        // from a failure before anything was signed.
+        for status in [
+            axum::http::StatusCode::PAYMENT_REQUIRED,
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            let url = spawn_resource_answering_paid_retry_with(
+                payment_required("stellar:testnet"),
+                status,
+            )
+            .await;
+            let client = X402Client::new(Duration::from_secs(5)).expect("client");
+            let signer = TestSigner::from_seed([0x55; 32]);
+
+            let result = client.get_with_payment(&url, &signer, NETWORK, 1_000).await;
+
+            assert_eq!(
+                result.err(),
+                Some(X402Error::UnexpectedStatusAfterPayment {
+                    status: status.as_u16()
+                }),
+                "paid retry answered {status}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_402_without_a_payment_required_header_is_missing_header() {
+        let url = spawn_router(axum::Router::new().route(
+            "/resource",
+            axum::routing::get(|| async { axum::http::StatusCode::PAYMENT_REQUIRED }),
+        ))
+        .await;
+        let client = X402Client::new(Duration::from_secs(5)).expect("client");
+        let signer = TestSigner::from_seed([0x55; 32]);
+
+        let result = client.get_with_payment(&url, &signer, NETWORK, 1_000).await;
+
+        assert_eq!(result.err(), Some(X402Error::MissingPaymentRequiredHeader));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_non_ascii_payment_required_header_is_invalid_payment_required() {
+        let url = spawn_router(axum::Router::new().route(
+            "/resource",
+            axum::routing::get(|| async {
+                let mut out = axum::http::HeaderMap::new();
+                out.insert(
+                    super::PAYMENT_REQUIRED_HEADER,
+                    axum::http::HeaderValue::from_bytes(b"\xffnot-ascii")
+                        .expect("obs-text is a legal header value"),
+                );
+                axum::response::IntoResponse::into_response((
+                    axum::http::StatusCode::PAYMENT_REQUIRED,
+                    out,
+                ))
+            }),
+        ))
+        .await;
+        let client = X402Client::new(Duration::from_secs(5)).expect("client");
+        let signer = TestSigner::from_seed([0x55; 32]);
+
+        let result = client.get_with_payment(&url, &signer, NETWORK, 1_000).await;
+
+        assert!(
+            matches!(result, Err(X402Error::InvalidPaymentRequired { .. })),
+            "expected InvalidPaymentRequired for a non-ASCII header, got {result:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn malformed_selected_terms_are_invalid_payment_required_and_nothing_is_sent() {
+        type Mutator = fn(&mut PaymentRequirements);
+        let cases: [(&str, Mutator); 5] = [
+            ("non-address asset", |r| {
+                r.asset = "not-an-address".to_string()
+            }),
+            ("non-address payTo", |r| {
+                r.pay_to = "not-an-address".to_string()
+            }),
+            ("non-integer amount", |r| r.amount = "1.5".to_string()),
+            ("negative amount", |r| r.amount = "-42000000".to_string()),
+            ("zero amount", |r| r.amount = "0".to_string()),
+        ];
+        for (label, mutate) in cases {
+            let mut required = payment_required("stellar:testnet");
+            mutate(&mut required.accepts[0]);
+            let resource = MockResource::spawn(required).await;
+            let client = X402Client::new(Duration::from_secs(5)).expect("client");
+            let signer = TestSigner::from_seed([0x55; 32]);
+
+            let result = client
+                .get_with_payment(&resource.url, &signer, NETWORK, 1_000)
+                .await;
+
+            assert!(
+                matches!(result, Err(X402Error::InvalidPaymentRequired { .. })),
+                "{label}: expected InvalidPaymentRequired, got {result:?}"
+            );
+            assert_eq!(
+                resource.request_count(),
+                1,
+                "{label}: no payment-bearing retry may be sent"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unreachable_resource_is_http_request_failed() {
+        // Bind then drop a listener so the port is (almost certainly) closed.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        drop(listener);
+        let client = X402Client::new(Duration::from_secs(5)).expect("client");
+        let signer = TestSigner::from_seed([0x55; 32]);
+
+        let result = client
+            .get_with_payment(&format!("http://{addr}/resource"), &signer, NETWORK, 1_000)
+            .await;
+
+        assert!(
+            matches!(result, Err(X402Error::HttpRequestFailed { .. })),
+            "expected HttpRequestFailed, got {result:?}"
+        );
     }
 }

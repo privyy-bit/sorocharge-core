@@ -99,12 +99,24 @@ pub(crate) struct MockRpc {
     pub(crate) state: Arc<MockRpcState>,
 }
 
+/// What `getTransaction` should answer, for tests that need a result other
+/// than the default "method not implemented" error.
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+pub(crate) enum MockGetTransaction {
+    /// A JSON-RPC error, as a transport/RPC failure produces.
+    RpcError,
+    /// A successful response whose on-chain transaction failed.
+    Failed,
+}
+
 pub(crate) struct MockRpcState {
     latest_ledger: u32,
     account_seq_num: i64,
     min_resource_fee: u64,
     methods: Mutex<Vec<String>>,
     simulation_events: Mutex<Option<Vec<String>>>,
+    get_transaction: Mutex<Option<MockGetTransaction>>,
 }
 
 impl MockRpc {
@@ -117,6 +129,7 @@ impl MockRpc {
             min_resource_fee: 100,
             methods: Mutex::new(Vec::new()),
             simulation_events: Mutex::new(None),
+            get_transaction: Mutex::new(None),
         });
         let router = Router::new()
             .route("/", post(handle_rpc))
@@ -134,6 +147,16 @@ impl MockRpc {
             .simulation_events
             .lock()
             .expect("simulation events lock") = Some(events);
+    }
+
+    /// Controls how the next `getTransaction` call is answered.
+    #[allow(dead_code)]
+    pub(crate) fn set_get_transaction(&self, outcome: MockGetTransaction) {
+        *self
+            .state
+            .get_transaction
+            .lock()
+            .expect("get transaction lock") = Some(outcome);
     }
 
     /// The JSON-RPC methods the client called, in order.
@@ -181,6 +204,34 @@ async fn handle_rpc(
                 "latestLedger": i64::from(state.latest_ledger),
             })
         }
+        "getTransaction" => {
+            let outcome = *state.get_transaction.lock().expect("get transaction lock");
+            match outcome {
+                Some(MockGetTransaction::RpcError) => {
+                    return Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": { "code": -32000, "message": "mock RPC failure" },
+                    }))
+                }
+                Some(MockGetTransaction::Failed) => json!({
+                    "status": "FAILED",
+                    "latestLedger": state.latest_ledger,
+                }),
+                None => json!({
+                    "error": {
+                        "code": -32601,
+                        "message": "mock RPC has no getTransaction behavior configured",
+                    }
+                }),
+            }
+        }
+        "sendTransaction" => json!({
+            "hash": "aa".repeat(32),
+            "status": "ERROR",
+            "latestLedger": state.latest_ledger,
+            "latestLedgerCloseTime": 0,
+        }),
         "simulateTransaction" => {
             let transaction_data = SorobanTransactionData::default()
                 .to_xdr_base64(Limits::none())

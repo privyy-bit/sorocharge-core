@@ -8,16 +8,55 @@ use sorocharge_signer::SorochargeError;
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum X402Error {
-    /// The underlying HTTP request itself failed (connection, TLS, timeout).
+    /// An HTTP request to the resource server was attempted and failed at
+    /// the transport level (connection, TLS, timeout) — no HTTP response
+    /// was received. Returned for the initial unpaid `GET` (after its
+    /// bounded retries are exhausted) and for the payment-bearing retry.
+    ///
+    /// A failure on the payment-bearing retry means the signed credential
+    /// may already have reached the server; see
+    /// [`X402Error::UnexpectedStatusAfterPayment`] for why a caller must not
+    /// blindly re-sign and resend.
     HttpRequestFailed { reason: String },
-    /// The resource responded with neither `402` (payment required) nor
-    /// `200` (already paid / free), which this client does not know how to
-    /// continue from.
+    /// The HTTP client itself could not be constructed (for example, the
+    /// TLS backend failed to initialise). No request was ever attempted.
+    ///
+    /// Distinct from [`X402Error::HttpRequestFailed`] because it is a local,
+    /// non-transient configuration failure: retrying the same call will not
+    /// succeed, whereas a failed request may.
+    HttpClientBuildFailed { reason: String },
+    /// The initial, unpaid request to the resource responded with neither
+    /// `402` (payment required) nor `200` (already paid / free), which this
+    /// client does not know how to continue from. No payment credential has
+    /// been built or sent when this is returned.
     UnexpectedStatus { status: u16 },
+    /// The payment-bearing retry (the request carrying `PAYMENT-SIGNATURE`)
+    /// responded with something other than `200`. A `402` here means the
+    /// server rejected the credential; any other status (e.g. a `5xx`) is
+    /// ambiguous.
+    ///
+    /// Distinct from [`X402Error::UnexpectedStatus`] because a signed
+    /// credential *has* been sent: the server may have settled it before
+    /// failing. A caller must not blindly re-sign and resend on this error
+    /// without first confirming on-chain whether the payment settled.
+    UnexpectedStatusAfterPayment { status: u16 },
     /// A `402` response carried no `PAYMENT-REQUIRED` header.
     MissingPaymentRequiredHeader,
-    /// The `PAYMENT-REQUIRED` header's value did not base64-decode to valid
-    /// `PaymentRequired` JSON.
+    /// The server's payment terms in the `PAYMENT-REQUIRED` header were
+    /// malformed. Specifically, one of:
+    ///
+    /// - the header value was not visible ASCII (so it cannot be base64);
+    /// - it did not base64-decode;
+    /// - the decoded bytes were not valid `PaymentRequired` JSON;
+    /// - the `accepts[]` entry selected for this network had an `asset` or
+    ///   `payTo` that is not a valid Stellar address, or an `amount` that is
+    ///   not a positive `i128` base-unit integer.
+    ///
+    /// The last case is a deliberate fold-in rather than its own variant:
+    /// the JSON decoded, but the terms it carries are equally unusable, and
+    /// the caller's only correct action is identical in every case — do not
+    /// pay, the server's challenge is broken. `reason` names which check
+    /// failed for diagnostics.
     InvalidPaymentRequired { reason: String },
     /// None of the server's `accepts[]` entries name the `exact` scheme on
     /// a Stellar network this client supports (`stellar:pubnet` /
@@ -81,9 +120,17 @@ impl fmt::Display for X402Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::HttpRequestFailed { reason } => write!(f, "HTTP request failed: {reason}"),
+            Self::HttpClientBuildFailed { reason } => {
+                write!(f, "failed to build HTTP client: {reason}")
+            }
             Self::UnexpectedStatus { status } => {
                 write!(f, "unexpected HTTP status {status} (expected 402 or 200)")
             }
+            Self::UnexpectedStatusAfterPayment { status } => write!(
+                f,
+                "unexpected HTTP status {status} on the payment-bearing retry (expected 200); \
+                 the credential was sent and may have settled"
+            ),
             Self::MissingPaymentRequiredHeader => {
                 write!(f, "402 response is missing the PAYMENT-REQUIRED header")
             }
